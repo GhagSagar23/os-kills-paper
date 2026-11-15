@@ -1,0 +1,961 @@
+% Measuring What Kills Your App: A Methodology for Detecting Background
+% Execution Failures in Production Android Apps
+% Target: IEEE Software (rolling submissions, ~4000-6000 words)
+% Format: IEEEtran journal/compsoc, single-anonymous
+
+\documentclass[10pt,journal,compsoc]{IEEEtran}
+
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{cite}
+\usepackage{enumitem}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  language=Java,
+  commentstyle=\color{gray},
+  keywordstyle=\color{blue},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  xleftmargin=2em,
+}
+
+\begin{document}
+
+\title{Measuring What Kills Your App:\\A Methodology for Detecting Background Execution Failures\\in Production Android Apps}
+
+\author{Sagar~Ghag
+\IEEEcompsocitemizethanks{\IEEEcompsocthanksitem S. Ghag is with Kryonex Labs, Pune, India.\protect\\
+E-mail: sagar.ghag1997@gmail.com}}
+
+\IEEEtitleabstractindextext{%
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+
+\begin{abstract}
+Background location tracking apps die in the field. Doze mode suspends
+them. OEM battery killers terminate their foreground services. Users
+revoke location permissions mid-shift. Practitioners know this from
+dontkillmyapp.com and production firefighting, but there is no published
+methodology for systematically detecting, classifying, and measuring
+these failures in a running app. The result: teams build ad-hoc
+telemetry that catches some failures and misses others, with no way to
+know which.
+
+We present a measurement methodology for background execution failures
+on Android. The methodology comprises three parts: a kill-cause taxonomy
+that classifies failures into five categories with distinct observable
+signals, an instrumentation specification that defines the minimum
+telemetry a production app needs to detect each category, and a
+classification procedure that maps observed signals to kill causes. We
+validate the methodology against a production Flutter app (104,886 lines,
+86 physical devices across three organisations (two accounting for 93\% of the
+fleet), two months of tracked field
+deployment) by auditing its existing telemetry against the specification.
+The audit found six detection signals already present and twelve gaps
+where failures go unrecorded. A database analysis of 159 tracking
+sessions and 14,094 waypoints revealed 509 timestamp gaps exceeding five
+minutes, 65 sessions (40.9\%) that captured three or fewer waypoints
+across multi-hour sessions, and 25 sessions (15.7\%) that ran until
+server timeout with no user-initiated end. The most consequential
+instrumentation gap: process kills that occur during a permission
+revocation are invisible because the revocation state is held in memory
+and lost with the process.
+
+The methodology is framework-agnostic in its taxonomy and classification
+rules. The instrumentation examples use Flutter and Android, but the
+signals and failure modes apply to any app that runs background services
+on Android.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Android, background execution, process kills, permission revocation,
+mobile telemetry, measurement methodology, OEM fragmentation.
+\end{IEEEkeywords}}
+
+\maketitle
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+
+\section{Introduction}
+\label{sec:intro}
+
+\IEEEPARstart{A}{~tracking} app that dies in the background looks the same
+as a tracking app that was never running. No crash report. No ANR dialog. The
+foreground service stops, the GPS radio goes silent, and three hours
+later the user opens the app to find a gap in the data where a
+delivery route should be.
+
+This is the central measurement problem for any Android app that depends
+on sustained background execution: location trackers, health monitors,
+fleet management tools, fitness apps. The OS actively works to kill them.
+Stock Android has Doze mode~\cite{android_doze} and App Standby
+Buckets~\cite{android_buckets}. OEM forks go further: Huawei's
+PowerGenie, Xiaomi's MIUI Autostart restrictions, OnePlus Deep
+Optimization, and Samsung's Sleeping Apps each enforce their own kill
+policies independently of stock Android
+behaviour~\cite{dontkillmyapp}. Users add a third vector by revoking
+permissions, sometimes intentionally, sometimes because Android 12+
+auto-revokes permissions for apps it considers
+inactive~\cite{android_hibernate}.
+
+The practitioner community tracks these problems through
+dontkillmyapp.com, a crowdsourced catalogue of OEM kill behaviours. The
+site is useful but unstructured: it lists workarounds per OEM without
+a detection methodology, without severity quantification, and without a
+way for an app to measure its own kill rate in the field.
+
+Academic work on mobile background execution focuses on energy
+consumption~\cite{li2014making,pathak2012energy} and permission
+models~\cite{felt2012android,au2012pscout}. The gap is in the middle:
+how to \emph{observe} what kills a background app in production, at what
+rate, and by what cause. This is the gap we address.
+
+We contribute:
+
+\begin{enumerate}
+  \item A \textbf{kill-cause taxonomy} that classifies background
+        execution failures into five categories, each with distinct
+        observable signals that a production app can detect
+        (Section~\ref{sec:taxonomy}).
+  \item An \textbf{instrumentation specification} that defines the
+        minimum set of events, metadata, and persistence requirements
+        for detecting each failure category
+        (Section~\ref{sec:instrumentation}).
+  \item A \textbf{classification procedure} that maps observed telemetry
+        signals to kill causes, including rules for disambiguating
+        overlapping signals (Section~\ref{sec:classification}).
+\end{enumerate}
+
+We validate the methodology against a production Flutter app with 86
+physical devices across three organisations, auditing its existing ad-hoc
+telemetry against the specification (Section~\ref{sec:validation}).
+
+% ============================================================================
+% 2. BACKGROUND: THE KILL LANDSCAPE
+% ============================================================================
+
+\section{How Android Kills Background Apps}
+\label{sec:landscape}
+
+Android's relationship with background apps has grown adversarial since
+API 23. Each OS version adds new restrictions; each OEM fork adds
+vendor-specific ones on top. For a developer building a location tracking
+app, ``Android'' is not one platform. It is at least six, and three of
+them will kill your foreground service without telling you.
+
+\subsection{Stock Android Restrictions}
+
+Doze mode (API 23+) suspends network access and defers alarms when the
+device is stationary and screen-off~\cite{android_doze}. Light Doze
+(API 24+) activates sooner, within minutes of screen-off on some
+devices. App Standby Buckets (API 28+) throttle background work based on
+recency of use: an app in the ``rare'' bucket gets fewer than 5 minutes
+of background execution per day~\cite{android_buckets}. Background
+Location Limits (API 26+) reduce location update frequency to a few
+times per hour for apps without a foreground service.
+
+These are documented. An app can request
+\texttt{REQUEST\_IGNORE\_BATTERY\_OPTIMIZATIONS} and run a foreground
+service with \texttt{FOREGROUND\_SERVICE\_LOCATION} (API 34+).  In
+theory, this exempts it from all of the above. In practice, it exempts
+it from stock Android's restrictions. OEM restrictions are a separate
+layer.
+
+\subsection{OEM Kill Policies}
+
+Table~\ref{tab:oem} summarises the OEM kill behaviours we have observed
+in production across six months of deployment on budget and mid-range
+Android devices in an emerging market where budget handsets dominate.
+
+\begin{table}[h]
+\caption{OEM background kill behaviours observed in production}
+\label{tab:oem}
+\small
+\begin{tabular}{@{}p{1.6cm}cp{4.8cm}@{}}
+\toprule
+OEM & Aggression & Observed behaviour \\
+\midrule
+Huawei    & 5/5 & PowerGenie kills foreground services independently of battery optimisation whitelist. Survives \texttt{isIgnoring\-BatteryOptimizations} check. \\
+Xiaomi    & 5/5 & MIUI Autostart disabled by default. Service killed within minutes of screen-off unless manually whitelisted. Settings reset on MIUI updates. \\
+OnePlus   & 5/5 & Deep Optimization kills services, resets settings after firmware updates. User must re-whitelist after every OTA. \\
+Samsung   & 4/5 & Sleeping Apps list auto-adds apps not used in 3 days. Foreground services survive but battery optimisation aggressively throttles GPS. \\
+Oppo      & 3/5 & ColorOS battery saver kills background apps. Less aggressive than MIUI but inconsistent across versions. \\
+Vivo      & 3/5 & Similar to Oppo. Auto-start management restricts cold launch of services. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The aggression scale is defined by three observable signals, each
+testable at runtime via the Android \texttt{Build} class and
+\texttt{PackageManager.resolveActivity()}:
+
+\begin{itemize}[nosep]
+  \item \textbf{S1: Foreground service kill.} The OEM kills a foreground
+        service that holds \texttt{FOREGROUND\_SERVICE\_LOCATION} and is
+        whitelisted via \texttt{isIgnoringBatteryOptimizations()}.
+  \item \textbf{S2: Settings reset on OTA.} The OEM resets battery
+        optimisation or autostart whitelist entries after a firmware
+        update, requiring the user to re-whitelist.
+  \item \textbf{S3: Background-only kill.} The OEM kills background
+        services or defers their restart, but foreground services survive
+        if whitelisted.
+\end{itemize}
+
+\noindent Rating: 5/5 = S1 + S2 (kills whitelisted foreground services
+\emph{and} resets the whitelist on OTA). 4/5 = S1 only (kills
+foreground services but whitelist persists across OTA). 3/5 = S3 only
+(background services killed; foreground services survive if whitelisted).
+2/5 = stock Android battery optimisation, no additional OEM
+restrictions. 1/5 = AOSP behaviour, no vendor modifications.
+
+The aggression ratings come from field deployment with 86 physical
+devices across three deploying organisations (two large fleets of 45 and
+35 devices, one smaller with 6). Xiaomi accounts for 41.9\% of the
+physical fleet; combined with OPPO, Vivo, and Realme, 65\% runs on
+OEMs rated aggression 3/5 or higher. The ratings are directional, not
+statistically rigorous; the fleet is too small for confidence intervals
+per OEM. But the session data tells its own story: of 159 tracked
+sessions over two months, 65 (40.9\%) captured three or fewer waypoints
+despite running for hours, and 25 (15.7\%) ran until server timeout
+without a user-initiated end. The order-of-magnitude gap between
+``working'' and ``silently dead'' sessions is consistent with
+practitioner reports on dontkillmyapp.com, and the database cannot tell
+us why because the telemetry to classify kill causes does not exist.
+
+The only public resource for OEM-specific behaviour is
+dontkillmyapp.com~\cite{dontkillmyapp}, which is maintained by the
+developer of the Don't Kill My App benchmarking tool. It catalogues
+workarounds per OEM but provides no detection methodology and no
+severity data. Our methodology fills this gap: not by replacing the
+workaround catalogue, but by giving apps a way to measure how often
+each kill vector actually fires in their fleet.
+
+\subsection{Permission Revocations}
+
+Permission revocation is the quietest kill vector. On Android 12+, the
+system auto-revokes permissions for apps it deems
+inactive~\cite{android_hibernate}. Users also manually downgrade from
+``Always'' to ``While using the app'' or revoke location entirely. In
+both cases, there is no callback, no crash, no error thrown in the
+running process. Location updates simply stop. The app continues running,
+believing it is tracking, producing zero-waypoint gaps that are
+indistinguishable from GPS hardware failure unless the app actively polls
+its own permission state.
+
+We observed this in production: a permission revocation during an active
+tracking session produced no error. The app's distance counter froze at
+the last known value. The tracked worker completed a 45 km route and
+the management dashboard showed 0.0 km for the last three hours of the
+session. The first indication of a problem was a phone call from the
+deploying organisation, not an alert.
+
+\subsection{Background Location Engine Architecture}
+\label{sec:engine}
+
+The audited app runs a background location engine compiled from Rust and
+accessed from Flutter via FFI. The engine operates as an Android
+foreground service with \texttt{FOREGROUND\_SERVICE\_LOCATION} (API 34+).
+It maintains its own native odometer (cumulative distance in metres),
+writes waypoints to local storage from a headless Dart isolate when the
+UI process is not running, and registers a \texttt{BOOT\_COMPLETED}
+receiver to restart after device reboot. The configuration sets
+\texttt{stopOnTerminate: false} and \texttt{startOnBoot: true}.
+
+This architecture produces three signals relevant to the measurement
+methodology. First, a native odometer that resets to zero when the
+service is fully killed and restarted: the reset is the fingerprint of a
+process-level kill. Second, headless waypoints (marked
+\texttt{source: 'headless'}) that prove the background service survived a
+UI kill. Third, a \texttt{BOOT\_COMPLETED} event in the native layer
+that fires on device restart. Of these three, only the headless waypoints
+reach the backend. The odometer reset is logged to \texttt{debugPrint}
+and the boot event produces no persisted record on the Dart side.
+
+% ============================================================================
+% 3. KILL-CAUSE TAXONOMY
+% ============================================================================
+
+\section{Kill-Cause Taxonomy}
+\label{sec:taxonomy}
+
+We classify background execution failures into five categories based on
+their cause and the observable signals each leaves behind.
+Table~\ref{tab:taxonomy} summarises the taxonomy.
+
+\begin{table*}[t]
+\caption{Kill-cause taxonomy: categories, observable signals, and detection requirements}
+\label{tab:taxonomy}
+\small
+\begin{tabular}{@{}p{2.4cm}p{3.2cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+Category & Cause & Observable signals & Detection requirements \\
+\midrule
+\textsc{Doze Kill} &
+Stock Android Doze / Light Doze suspends or kills the process &
+Waypoint gap with duration matching Doze maintenance window cadence ($\sim$15 min intervals). Process restart with no user interaction. Battery level continuous (not charged during gap). &
+Persisted \texttt{last\_clean\_exit} flag. Timestamp of last waypoint before gap. Device not rebooted (uptime continuous). \\
+
+\textsc{OEM Kill} &
+Vendor battery manager (PowerGenie, MIUI, etc.) terminates the foreground service or process &
+Waypoint gap. Native odometer resets to zero (service restarted). No Doze maintenance pattern in gap timing. OEM identified as aggressive ($\geq$4/5 aggression rating). &
+OEM and OS version attached to session. Native odometer checkpoint persisted to disk. Aggression rating lookup per OEM. \\
+
+\textsc{User Force Stop} &
+User swipes app from recents or taps ``Force Stop'' in Settings &
+Process death. No headless waypoints during gap (headless isolate killed with app). Boot receiver does not fire (not a reboot). Gap starts at a non-Doze-aligned time. &
+Headless task liveness signal (heartbeat). Persisted process-start marker with monotonic ID. \\
+
+\textsc{Reboot} &
+Device restarted (user-initiated, OTA, crash) &
+Process death. Boot receiver fires (\texttt{BOOT\_COMPLETED}). Device uptime resets. Gap duration includes boot time. &
+Boot receiver logs a \texttt{device\_reboot} event with timestamp. Previous uptime persisted. \\
+
+\textsc{Permission Revocation} &
+User or OS revokes location permission while app is running or between sessions &
+Location updates stop but process may continue running. \texttt{checkPermission()} returns denied on next poll. No process death (unless combined with another kill). &
+Periodic permission polling (not only on foreground resume). Permission state persisted to disk so that a revocation during process death is detectable on next launch. \\
+
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Two notes on the taxonomy.
+
+First, categories are not mutually exclusive. A Doze kill followed by
+a permission revocation while the process is dead produces a compound
+failure that must be decomposed. The classification procedure
+(Section~\ref{sec:classification}) handles this.
+
+Second, the taxonomy is conservative. We do not include low-memory kills
+(\texttt{onTrimMemory} / OOM) as a separate category because we have not
+observed them as a primary cause in our fleet. The devices are budget
+handsets (Redmi 9A, 3 GB RAM) running a 104,886-line app. If
+low-memory kills were frequent, we would expect to see them here. We
+did not, which suggests that foreground service priority is sufficient
+protection against OOM on current Android versions. This may not hold
+for devices with 1--2 GB RAM or for apps without a foreground service.
+
+% ============================================================================
+% 4. INSTRUMENTATION SPECIFICATION
+% ============================================================================
+
+\section{Instrumentation Specification}
+\label{sec:instrumentation}
+
+This section defines the minimum telemetry a production app needs to
+detect each failure category. The specification has three layers:
+events, metadata, and persistence.
+
+\subsection{Events}
+\label{sec:events}
+
+Seven events form the core of the measurement framework.
+Table~\ref{tab:events} lists them with their trigger conditions and
+required fields.
+
+\begin{table}[h]
+\caption{Core measurement events}
+\label{tab:events}
+\small
+\begin{tabular}{@{}p{2.8cm}p{5.5cm}@{}}
+\toprule
+Event & Trigger and required fields \\
+\midrule
+\texttt{process\_start} &
+App process created. Fields: \texttt{launch\_id} (monotonic),
+\texttt{timestamp}, \texttt{was\_clean\_exit} (from persisted flag),
+\texttt{device\_uptime}. \\
+
+\texttt{process\_exit} &
+\texttt{onDestroy} or clean shutdown path. Fields: \texttt{timestamp},
+\texttt{exit\_reason}. Sets \texttt{last\_clean\_exit = true}
+on disk. \\
+
+\texttt{service\_restart} &
+Foreground service re-created after being killed. Fields:
+\texttt{timestamp}, \texttt{native\_odometer\_value} (0 indicates
+full kill), \texttt{last\_known\_odometer}. \\
+
+\texttt{permission\_change} &
+Permission state differs from last persisted state. Fields:
+\texttt{timestamp}, \texttt{previous\_state},
+\texttt{current\_state}, \texttt{trigger} (poll / resume / boot). \\
+
+\texttt{device\_reboot} &
+\texttt{BOOT\_COMPLETED} receiver fires. Fields: \texttt{timestamp},
+\texttt{previous\_uptime} (persisted), \texttt{current\_uptime}. \\
+
+\texttt{heartbeat} &
+Periodic liveness signal from background task. Fields:
+\texttt{timestamp}, \texttt{battery\_level}, \texttt{gps\_state}. \\
+
+\texttt{gap\_detected} &
+Waypoint timestamp gap exceeds expected interval by $>$2x. Fields:
+\texttt{gap\_start}, \texttt{gap\_end}, \texttt{gap\_seconds},
+\texttt{classified\_cause} (filled by classification procedure). \\
+
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \texttt{heartbeat} event deserves explanation. Its purpose is not
+health monitoring in the distributed-systems sense. It is a liveness
+proof: if heartbeats stop, the process is dead, and the last heartbeat
+timestamp gives the time of death. Without it, the only evidence of a
+kill is the absence of waypoints, which is ambiguous (the device could
+be stationary, GPS could be off, the user could be indoors). A heartbeat
+every 60 seconds adds negligible battery cost (no GPS, no network, just
+a local timestamp write) and converts ``no data'' from ambiguous silence
+into evidence of process death.
+
+\subsection{Metadata}
+\label{sec:metadata}
+
+Every event must carry device context: OEM (\texttt{manufacturer}),
+\texttt{model}, \texttt{os\_version}, \texttt{sdk\_int}. This context is
+available from Android's \texttt{Build} class and costs nothing to
+collect, but it must be attached at event time, not only at login. In
+the production app we audited, device info was captured once at
+authentication and never attached to tracking sessions or permission
+events. An OS upgrade between login and failure would be invisible.
+
+\texttt{process\_start} and \texttt{service\_restart} should also carry
+the current battery optimisation state:
+\texttt{isIgnoringBatteryOptimizations()}, the OEM-specific autostart
+state (where detectable), and the app's current Standby Bucket (API
+28+). These fields distinguish between kills where the app had proper
+exemptions and kills where it did not, which is critical for separating
+OEM aggression from misconfiguration.
+
+\subsection{Persistence}
+\label{sec:persistence}
+
+The hardest requirement. The following state must survive process death:
+
+\begin{itemize}[nosep]
+  \item \texttt{last\_clean\_exit}: boolean, written on clean shutdown,
+        cleared on dirty start.
+  \item \texttt{last\_heartbeat\_timestamp}: last heartbeat time.
+  \item \texttt{last\_permission\_state}: the permission state at last
+        check.
+  \item \texttt{native\_odometer\_checkpoint}: last known odometer value
+        from the background service.
+  \item \texttt{device\_uptime\_checkpoint}: uptime at last heartbeat.
+  \item \texttt{process\_launch\_id}: monotonic counter incremented on
+        each process start.
+\end{itemize}
+
+SharedPreferences (or equivalent key-value store) is sufficient. The
+writes are small and infrequent. The critical constraint: these writes
+must happen synchronously before the state they protect becomes relevant.
+A heartbeat that writes the timestamp \emph{after} doing other work
+defeats the purpose if the process is killed during that work.
+
+One pattern we found in the audited app illustrates the failure mode.
+The permission revocation state (\texttt{\_permissionRevokedAt},
+\texttt{\_lastPermissionStatus}, \texttt{\_preRevokeSpeedMps}) was held
+in static Dart fields, never persisted. If the OS killed the process
+during a revocation gap, the gap was lost. On next launch, the
+permission status field was null, so the first resume logged
+\texttt{foreground\_resume} instead of \texttt{permission\_revoked}. The
+revocation happened; the telemetry said it did not.
+
+% ============================================================================
+% 5. CLASSIFICATION PROCEDURE
+% ============================================================================
+
+\section{Classification Procedure}
+\label{sec:classification}
+
+Given the events from Section~\ref{sec:events}, the classification
+procedure maps an observed gap to a kill cause. The procedure runs on
+each detected gap after the app resumes or restarts.
+
+\subsection{Decision Tree}
+
+\begin{enumerate}
+  \item \textbf{Check \texttt{device\_reboot} event.} If a reboot event
+        exists with a timestamp inside the gap window: classify as
+        \textsc{Reboot}. If the gap extends beyond boot completion,
+        check for a secondary cause in the post-boot portion.
+
+  \item \textbf{Check permission state.} If
+        \texttt{last\_permission\_state} (persisted) was granted and
+        current state is denied: classify as
+        \textsc{Permission Revocation}. If the process also died (no
+        heartbeats during gap), classify as compound:
+        \textsc{Permission Revocation} + secondary kill cause.
+
+  \item \textbf{Check \texttt{was\_clean\_exit}.} If the process
+        restarted and \texttt{was\_clean\_exit} is false: the process
+        was killed. Proceed to distinguish kill cause.
+
+  \item \textbf{Check native odometer.} If the native background service
+        odometer reset to zero: the service was fully killed and
+        restarted, not just the UI process. This eliminates
+        \textsc{User Force Stop} on devices where force-stop prevents
+        boot-receiver restart (most OEMs). Classify as \textsc{OEM Kill}
+        if the device OEM exhibits signal S1 (foreground service kill
+        despite whitelist; aggression $\geq$4/5 per
+        Section~\ref{sec:landscape}), or as \textsc{Doze Kill} if the
+        gap duration matches Doze maintenance windows.
+
+  \item \textbf{Check headless heartbeats.} If heartbeats continued
+        during the gap: the background service was alive but the UI
+        process was not. This is a UI-only kill (low memory or user
+        swiped from recents without force-stopping the service).
+        Classify as \textsc{User Force Stop} (partial).
+
+  \item \textbf{No heartbeats, no odometer reset, no reboot.} The
+        process died and the service did not restart. On OEMs exhibiting
+        S1 or S3, classify as \textsc{OEM Kill}. On stock Android or Samsung,
+        classify as \textsc{Doze Kill} if gap timing aligns with
+        maintenance windows, otherwise \textsc{Unknown}.
+\end{enumerate}
+
+\subsection{Disambiguation Limits}
+
+Some kill causes cannot be distinguished with client-side telemetry
+alone. A Doze kill on a Xiaomi device could be Doze or MIUI; without
+access to the OEM's battery manager logs, the classification is
+best-effort. We accept this. The taxonomy does not promise forensic
+certainty. It promises structured observation where none existed before.
+
+The \textsc{Unknown} category is deliberate. A measurement system that
+forces every observation into a named cause will misclassify more than
+one that admits uncertainty. Our goal is a high-confidence subset (reboot
+and permission revocation are unambiguous) plus a best-effort remainder.
+
+% ============================================================================
+% 6. VALIDATION
+% ============================================================================
+
+\section{Validation: Auditing a Production App}
+\label{sec:validation}
+
+We applied the methodology to Zontra, a production field workforce
+tracking app built in Flutter. The app has 104,886 lines of Dart in
+\texttt{lib/}, runs on 86 physical devices (94 registered, 8 emulators
+excluded) across three deploying organisations (two primary fleets of 45
+and 35 devices, one smaller with 6), and has been in
+production for six months at the time of this audit. The database
+analysis covers two months of tracked sessions (August 29 to October 29,
+2026): 159 tracking sessions, 14,094 waypoints, 211 attendance sessions.
+The app uses a Rust-based background location engine accessed via FFI
+(Section~\ref{sec:engine}), with Firebase Authentication, Firestore for
+real-time sync, and SharedPreferences for local persistence.
+
+The fleet is 41.9\% Xiaomi (the most aggressive OEM at 5/5), with Vivo
+(17.1\%), OPPO (10.5\%), and a long tail of 30+ distinct models from
+ten OEMs. Android versions span 8.1 to 17. Two organisations account for
+93\% of the fleet: one runs a controlled fleet of bulk-purchased POCO X8
+Pro Max handsets, the other is BYOD across budget to mid-range devices.
+
+We are also the developers of this app. This dual role is a threat to
+validity (Section~\ref{sec:threats}) but an advantage for the audit: we
+have full access to the source code, the production database, and the
+incident history.
+
+\subsection{Existing Detection Signals}
+
+The app has six signals that partially detect background execution
+failures:
+
+\begin{enumerate}[nosep]
+  \item \textbf{\texttt{PermissionEvent} model.} Fields:
+        \texttt{timestamp}, \texttt{status}, \texttt{trigger},
+        \texttt{previousStatus}, \texttt{gapDurationSeconds},
+        \texttt{deadReckoningMeters}. Triggers:
+        \texttt{tracking\_start}, \texttt{foreground\_resume},
+        \texttt{permission\_revoked}, \texttt{permission\_restored},
+        \texttt{app\_start}. Stored in SharedPreferences under
+        \texttt{permission\_log}.
+
+  \item \textbf{Native odometer regression.} If the native background
+        service reports an odometer value lower than the last
+        persisted checkpoint, the code infers the service was ``fully
+        killed and restarted from 0.'' This detection exists in the
+        codebase but is logged only to \texttt{debugPrint}. It does
+        not produce a persisted event.
+
+  \item \textbf{Waypoint gap inference.} Waypoints carry a
+        \texttt{previousId} field. A break in the chain is documented
+        in the model as ``permission revocation, process kill, or other
+        interruption.'' The gap is observable but not classified.
+
+  \item \textbf{Headless waypoints.} The background isolate writes
+        waypoints with \texttt{source: 'headless'}. Their presence
+        proves the background service was alive. Their absence during
+        a gap is evidence (not proof) of process death.
+
+  \item \textbf{Session summary absence.} The odometer writes a
+        \texttt{OdometerSessionSummary} on clean teardown. A session ID
+        with no summary is a killed session. This is never checked
+        programmatically.
+
+  \item \textbf{\texttt{tracking\_reconciled} event.} If the native
+        service is tracking but the Dart engine's \texttt{\_running}
+        flag is false on launch, a \texttt{tracking\_reconciled} event
+        fires with \texttt{action=reattach}. This is the closest thing
+        to a restart event and it is logged to Firebase Analytics.
+\end{enumerate}
+
+\subsection{Gaps Found}
+\label{sec:gaps}
+
+The audit found twelve gaps where the existing telemetry fails to detect
+or classify failures. We group them by the instrumentation layer they
+affect.
+
+\textbf{Event gaps.}
+(1)~No \texttt{process\_start} or \texttt{process\_exit} events exist.
+The only launch signal is \texttt{app\_opened} with
+\texttt{is\_cold\_start}, which does not carry a clean-exit flag or a
+launch ID.
+(2)~No \texttt{device\_reboot} event. The \texttt{BOOT\_COMPLETED}
+receiver exists in the location engine's native code
+(Section~\ref{sec:engine}) but produces no persisted event on the Dart
+side.
+(3)~No heartbeat. There is no periodic liveness signal from the
+background service. Silence is ambiguous.
+(4)~The native odometer regression (signal 2 above) goes to
+\texttt{debugPrint} only. It is not persisted, not sent to analytics,
+and not visible outside a debug build.
+
+\textbf{Metadata gaps.}
+(5)~Device context (OEM, OS version, SDK) is captured at login and never
+attached to tracking sessions, permission events, or Sentry scope. An OS
+upgrade after login is invisible.
+(6)~Battery optimisation state is never logged. The event
+\texttt{battery\_optimization\_exempt} is declared in the analytics
+registry but has no call site.
+
+\textbf{Persistence gaps.}
+(7)~Permission revocation state is held in static Dart fields
+(\texttt{\_permissionRevokedAt}, \texttt{\_lastPermissionStatus},
+\texttt{\_preRevokeSpeedMps}) and lost on process death. A kill during a
+revocation gap erases the revocation.
+(8)~The gap duration is clamped to 60 seconds and dead-reckoning
+distance to 5,000 metres before logging. Real gaps exceeding these
+limits are truncated. A 3-hour gap from an OEM kill is recorded as 60
+seconds.
+
+\textbf{Detection gaps.}
+(9)~Permission checks run only on foreground resume, triggered by
+\texttt{didChangeAppLifecycleState} in a single widget
+(\texttt{HomeBody}). There is no periodic poll, no background check. A
+revocation during an active session is detected only when the user
+returns to the home screen.
+(10)~Only \texttt{locationWhenInUse} is checked. An ``Always'' to
+``While using'' downgrade is invisible because both return granted for
+\texttt{locationWhenInUse}.
+(11)~The backend never receives permission events. The PRD specifies a
+backend sink (documented in the API spec), but the app does not
+upload the \texttt{permission\_log}. All permission data is local-only
+and lost on app reinstall.
+(12)~Silent \texttt{catch} blocks in lifecycle code
+(\texttt{\_reattach}, \texttt{\_teardown},
+\texttt{\_reconcileWithServer}) swallow errors. Failures in the
+restart and recovery paths are not observable.
+
+\subsection{Database Analysis}
+\label{sec:database}
+
+We analysed the production database to quantify what the gaps hide.
+Table~\ref{tab:sessions} summarises the session-level findings.
+
+\begin{table}[h]
+\caption{Tracking session analysis (159 sessions, Aug--Oct 2026)}
+\label{tab:sessions}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+Metric & Value \\
+\midrule
+Total tracking sessions & 159 \\
+Total waypoints & 14,094 \\
+Sessions with $\leq$3 waypoints & 65 (40.9\%) \\
+Sessions ended by server timeout & 25 (15.7\%) \\
+Sessions with location gap $>$30 min & 25 \\
+Waypoint gaps $>$5 min (within sessions) & 509 \\
+Longest intra-session gap & 110 h 50 min \\
+Waypoint source: foreground & 81.7\% \\
+Waypoint source: headless/background & 18.3\% \\
+GPS off or unknown at session end & 100/159 (62.9\%) \\
+Sessions ending $\leq$15\% battery & 5 (3.1\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three patterns stand out.
+
+\textbf{Pattern 1: Sessions that start and immediately die.}
+65 sessions captured three or fewer waypoints despite running for hours.
+Session TRK-00001020 ran for 9 hours and 6 minutes and recorded one
+waypoint. TRK-00001041 ran for 9 hours and 1 minute: also one waypoint.
+These are sessions where the tracking engine started, captured an initial
+fix, and then went silent. The existing telemetry cannot say why. Battery
+was not the cause: TRK-00001044 ended at 96\% battery with two waypoints
+over 9 hours.
+
+\textbf{Pattern 2: Sequence resets as kill evidence.}
+Three sessions show waypoint sequence numbers resetting to zero
+mid-session: 182$\to$0 (with battery jumping from 47\% to 100\%,
+indicating a kill during charging and a restart after), 174$\to$0, and
+29$\to$0. These resets are the fingerprint of a full service kill and
+restart. The app already detects this (signal 2, native odometer
+regression) but logs it only to \texttt{debugPrint}. In the database,
+these resets are visible only by inspecting raw waypoint sequences. One
+session shows the inverse: sequence 39$\to$246, a gap of 207 missing
+sequence numbers. These waypoints were generated by the headless
+background service but never uploaded, accumulating locally until the app
+reconnected.
+
+\textbf{Pattern 3: The \texttt{permission\_event} table is empty.}
+The backend schema defines a \texttt{permission\_event} table. It
+contains zero rows. The client-side permission log is stored in
+SharedPreferences and never uploaded. This confirms gap 11 from the
+audit: all permission event data is local-only, lost on app reinstall,
+and invisible to any server-side analysis.
+
+\subsection{Incident Examples}
+
+Two production incidents illustrate what the combined gaps cost.
+
+\textbf{Incident 1: 45 km route recorded as 0.0 km.} A mid-session
+permission revocation went undetected because the check runs only on
+foreground resume. The tracked worker completed a route and the
+management view showed zero distance for the last three hours. Time to
+diagnose: 4 hours, because the permission log showed no revocation event
+(gap 9).
+
+\textbf{Incident 2: Session data missing on Xiaomi fleet.} MIUI killed
+the foreground service on 8 of 12 Xiaomi devices during extended
+sessions. The odometer regression detection fired (gap 4) but went to
+\texttt{debugPrint}. There was no alert, no analytics event, no way to
+distinguish OEM kills from other causes without SSH access to each
+device. Time to diagnose: two days, most of it spent confirming that the
+kills were OEM-caused and not a code regression.
+
+Both incidents would have been caught within minutes if the
+instrumentation specification from Section~\ref{sec:instrumentation} had
+been implemented: heartbeat absence for Incident 1, persisted odometer
+regression event with OEM metadata for Incident 2.
+
+% ============================================================================
+% 7. THREATS TO VALIDITY
+% ============================================================================
+
+\section{Threats to Validity}
+\label{sec:threats}
+
+\textbf{External validity.} The taxonomy and methodology are derived
+from one production app on one platform (Android) with one use case
+(field workforce tracking). Other app categories (health monitoring,
+fitness, IoT) may encounter kill patterns we have not observed. The
+OEM aggression ratings are based on 86 devices in one regional market;
+OEM behaviour may differ across regions, firmware branches, and carrier
+customisations.
+
+\textbf{Internal validity.} The gap analysis combines a code audit with
+a database analysis. We can count gaps (509 over 5 minutes) and identify
+sessions that captured almost no data (65 of 159), but we cannot
+classify the cause of each gap without the instrumentation this paper
+proposes. The 40.9\% figure for near-empty sessions is a symptom count,
+not a diagnosis. The incident examples are retrospective; we selected
+them because they illustrate the gaps, which introduces selection bias.
+
+\textbf{Construct validity.} The taxonomy classifies by cause. Some
+practitioners may prefer classification by impact (data loss duration,
+recovery success) or by user-facing symptom (distance gap, frozen
+counter, session timeout). Our taxonomy is not the only valid one; it is
+the one we found most actionable for debugging.
+
+\textbf{Researcher bias.} We built the app, designed its telemetry,
+and found it wanting. We have an incentive to frame the gaps as
+significant. The mitigation: every gap is tied to a specific code
+location and a specific detection failure that a reader can verify in
+the described architecture.
+
+\textbf{iOS.} We do not cover iOS. Apple's background execution model
+is different (no foreground service equivalent, silent push throttling
+at 2--3 per hour, 30-second background execution limit). The taxonomy
+categories exist on iOS but the signals differ enough that a separate
+treatment is warranted.
+
+% ============================================================================
+% 8. RELATED WORK
+% ============================================================================
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Crash reporting and mobile observability.}
+Firebase Crashlytics~\cite{firebase_crashlytics} and similar tools
+(Bugsnag, Sentry) capture crashes, ANRs, and non-fatal exceptions.
+They are the standard first layer of mobile reliability telemetry. But
+they share a structural blind spot: a background process killed by the
+OS produces no crash, no ANR, no exception. The kill is invisible to
+the crash reporter because no code ran to report it. Our methodology
+targets exactly this gap. Fan et al.~\cite{fan2018large} analysed
+16,245 framework-specific exception traces across 2,486 Android apps
+at ICSE~2018 and found that framework exceptions dominate crash reports.
+Their work confirms that crash reporting is thorough for exceptions that
+fire; it says nothing about silent kills where no exception fires at
+all. Li et al.~\cite{li2020aging} conducted a large-scale study of
+Android ANR and SNR events across 30,000 devices and found that
+responsiveness problems are pervasive across hardware. ANR is the
+closest the OS gets to reporting a background failure, but ANR requires
+the process to be alive and unresponsive. A killed process is not
+unresponsive; it is absent.
+
+\textbf{Background execution, energy, and scheduling.}
+Li et al.~\cite{li2014making} studied background energy drain on
+Android. Pathak et al.~\cite{pathak2012energy} built eprof for
+fine-grained energy profiling. Liu et al.~\cite{liu2016wake} studied
+wake lock misuses across 44,736 Android apps and built a static
+analysis tool to detect them. All three focus on energy cost, not on
+whether the OS terminates the process. Gonz\'{a}lez-P\'{e}rez et
+al.~\cite{gonzalez2022reliable} addressed the scheduling side directly:
+their study of Android background task scheduling found that OS
+restrictions make reliable periodic execution difficult, and they
+released a scheduling library that works at up to one-minute intervals.
+Their work is the closest to ours in motivation: they want background
+tasks to run reliably. The difference is scope. They address scheduling
+(when does the task run?); we address detection (did the task survive,
+and if not, why?).
+
+\textbf{Android permissions.}
+Felt et al.~\cite{felt2012android} analysed the Android permission
+model's effectiveness. Au et al.~\cite{au2012pscout} mapped the
+permission specification. Wijesekera et
+al.~\cite{wijesekera2015android} studied permission decisions in
+context. This body of work treats permissions as a security and privacy
+mechanism. We treat permission revocation as a reliability failure:
+when a tracking app loses location permission mid-session, the security
+model is working correctly, but the app's function is broken, and
+detecting that break in real time is an unsolved measurement problem.
+
+\textbf{Mobile app reliability.}
+Liu et al.~\cite{liu2014characterizing} characterised performance bugs
+in mobile apps. Nistor et al.~\cite{nistor2013discovering} studied
+performance bugs that manifest only under specific usage patterns.
+Neither addresses background execution kills as a failure category.
+The gap is telling: the mobile reliability literature has studied
+crashes, performance, and responsiveness, but silent process death is
+not in the taxonomy of any prior study we found.
+
+\textbf{OEM fragmentation and customisation.}
+Wei et al.~\cite{wei2016taming} studied Android fragmentation at the
+API level. The fragmentation that drives \textsc{OEM Kill} in our
+taxonomy is different: it lives in vendor battery management policies,
+not in API compatibility. Three studies address the OEM customisation
+layer directly. Wu et al.~\cite{wu2015vendor} reversed vendor-customised
+apps from 12 smartphones and found quality, reliability, and security
+problems in nearly every one. Possemato et
+al.~\cite{possemato2021trust} analysed 2,907 ROMs from 42 OEMs and
+found that 20\% violated Android's Compatibility Definition Document.
+Dong et al.~\cite{dong2024same} studied device-specific behaviours in
+20,000+ apps and found that apps in Chinese third-party markets exhibit
+more device-conditional code than Google Play apps, targeting
+manufacturers with larger market share. None of these studies measures
+OEM-caused process kills specifically. The only systematic
+documentation of OEM battery management behaviour remains
+dontkillmyapp.com~\cite{dontkillmyapp}, a practitioner resource.
+
+\textbf{Flutter and cross-platform.}
+Ghag~\cite{ghag2026testing} reported on testing a Flutter app with
+heavy platform integration, documenting the coverage exclusion policies
+and mock-boundary strategies required for the same codebase (Zontra).
+That work addresses testing infrastructure; this work addresses runtime
+observability. Bi{\o}rn-Hansen et al.~\cite{biorn2020flutter} surveyed
+cross-platform approaches including Flutter but did not address
+background execution or kill behaviour.
+
+% ============================================================================
+% 9. DISCUSSION
+% ============================================================================
+
+\section{Discussion}
+\label{sec:discussion}
+
+The methodology has a ceiling we have not broken through. Client-side
+telemetry cannot distinguish between a Doze kill and an OEM kill on
+devices where both could be responsible. The classification procedure
+uses OEM aggression ratings as a heuristic, but a heuristic is not a
+root cause. Breaking through would require access to the OS's battery
+manager logs or a kernel-level probe, neither of which is available to a
+production app.
+
+We considered and rejected a controlled-experiment design as an
+alternative validation strategy. Running each kill vector on a device
+lab would produce clean causal data but would not validate the
+methodology's ability to detect kills in production, where the
+conditions are uncontrolled and the signals are noisy. The field
+deployment, despite its small scale, tests exactly what matters: whether
+the methodology detects real failures that real ad-hoc telemetry misses.
+
+One finding surprised us. The most consequential gap was not a missing
+event or a missing metadata field. It was a persistence failure:
+in-memory permission state lost on process death (gap 7). This is a
+pattern that would survive most code reviews. The variable names are
+reasonable, the logic is correct when the process stays alive, and the
+failure requires a specific interleaving (revocation, then kill, then
+restart) that is hard to reason about in a code review but happens
+routinely in the field. Measurement methodologies that focus on what
+events to log will miss this class of bug. Persistence requirements are
+the harder, less obvious part of the specification.
+
+% ============================================================================
+% 10. CONCLUSION
+% ============================================================================
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have not solved the background kill problem. We have described how to
+see it.
+
+Seven events, a metadata contract, and a persistence specification
+convert silent failures into classified observations. The audit of a
+production app found twelve detection gaps; the database behind it held
+509 unexplained waypoint gaps and 65 near-empty sessions out of 159. The
+OEM Kill and Doze Kill boundary remains genuinely blurry on some devices,
+and the taxonomy accepts that: five categories, one explicit
+\textsc{Unknown}, no false confidence.
+
+Two limitations bound these results. First, the methodology is validated
+against one app on one platform in one use case. The taxonomy may be
+incomplete for health monitors, fitness apps, or IoT controllers that
+face different kill profiles. Second, we have not implemented the
+specification and measured the before/after detection rate. The gap
+analysis shows what existing telemetry misses; it does not yet show that
+the proposed telemetry catches it. Both limitations point to the same
+next step: implement the specification in a production app and measure
+the change. We have not validated on iOS, where the background execution
+model differs enough that the instrumentation does not transfer even
+though the taxonomy categories do.
+
+The measurement framework is methodology, not software. Any team with
+a background-service app and a key-value store can implement it. The
+harder part is not the code; it is recognising that the default
+telemetry (crash reports, analytics events, permission checks on resume)
+is structurally blind to the failures that cost the most.
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
